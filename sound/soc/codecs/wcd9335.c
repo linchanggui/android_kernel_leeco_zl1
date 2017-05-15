@@ -45,6 +45,20 @@
 #include "wcd_cpe_core.h"
 #include "wcdcal-hwdep.h"
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+#include <linux/input/sweep2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+#endif
+#include <linux/input/scroff_volctr.h>
+#define SOVC_TOUCH_OFF_DELAY	5000	// Touch off delay time (ms)
+
+extern int synaptics_rmi4_touch_off_trigger(unsigned int delay);
+static DEFINE_MUTEX(sovc_lock);
+#endif
+
 #define TASHA_RX_PORT_START_NUMBER  16
 
 #define WCD9335_RATES_MASK (SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
@@ -10558,6 +10572,22 @@ static int tasha_startup(struct snd_pcm_substream *substream,
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	if (!strcmp(dai->name, "tomtom_tx1"))
+		sovc_mic_detected = true;
+
+	track_changed = false;
+	if (!sovc_switch)
+		return 0;
+
+	mutex_lock(&sovc_lock);
+	sovc_tmp_onoff = 1;
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+	dt2w_switch_tmp = 1;
+#endif
+	mutex_unlock(&sovc_lock);
+#endif
+
 	return 0;
 }
 
@@ -10566,6 +10596,21 @@ static void tasha_shutdown(struct snd_pcm_substream *substream,
 {
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	if (!strcmp(dai->name, "tomtom_tx1"))
+		sovc_mic_detected = false;
+
+	mutex_lock(&sovc_lock);
+	sovc_tmp_onoff = 0;
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+	dt2w_switch_tmp = 0;
+#endif
+	mutex_unlock(&sovc_lock);
+
+	if (sovc_scr_suspended)
+		synaptics_rmi4_touch_off_trigger(SOVC_TOUCH_OFF_DELAY);
+#endif
 }
 
 static int tasha_set_decimator_rate(struct snd_soc_dai *dai,

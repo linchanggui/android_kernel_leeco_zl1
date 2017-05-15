@@ -34,6 +34,16 @@
 #include "mdss_dsi_phy.h"
 #include "mdss_dba_utils.h"
 
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+#include <linux/input/sweep2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+#include <linux/input/scroff_volctr.h>
+#endif
+
 #define XO_CLK_RATE	19200000
 #define CMDLINE_DSI_CTL_NUM_STRING_LEN 2
 
@@ -267,6 +277,19 @@ static int mdss_dsi_panel_power_off(struct mdss_panel_data *pdata)
 		pr_err("%s: failed to disable vregs for %s\n",
 			__func__, __mdss_dsi_pm_name(DSI_PANEL_PM));
 
+/* lcg */
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+	if (s2w_switch)
+		goto end;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+	if (dt2w_switch)
+		goto end;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	if (sovc_switch && sovc_tmp_onoff)
+		goto end;
+#endif
 end:
 	return ret;
 }

@@ -26,6 +26,21 @@
 #include "mdss_dsi.h"
 #include "mdss_dba_utils.h"
 
+/* lcg */
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+#include <linux/input/sweep2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+#include <linux/input/scroff_volctr.h>
+#endif
+
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+static int onboot = true;
+#endif
+
 #define DT_CMD_HDR 6
 #define MIN_REFRESH_RATE 48
 #define DEFAULT_MDP_TRANSFER_TIME 14000
@@ -328,6 +343,14 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 	pr_debug("%s: enable = %d\n", __func__, enable);
 
 	if (enable) {
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+		if (onboot == false) {
+			gpio_set_value((ctrl_pdata->rst_gpio), 0);
+			gpio_free(ctrl_pdata->rst_gpio);
+		}
+		onboot = false;
+#endif
+
 		rc = mdss_dsi_request_gpios(ctrl_pdata);
 		if (rc) {
 			pr_err("gpio request failed\n");
@@ -402,13 +425,29 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			gpio_set_value((ctrl_pdata->disp_en_gpio), 0);
 			gpio_free(ctrl_pdata->disp_en_gpio);
 		}
+
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+		if (s2w_switch)
+			goto end;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+		if (dt2w_switch)
+			goto end;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+		if (sovc_switch && sovc_tmp_onoff)
+			goto end;
+#endif
+
 		gpio_set_value((ctrl_pdata->rst_gpio), 1);
 		gpio_free(ctrl_pdata->rst_gpio);
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+end:
+#endif
 		if (gpio_is_valid(ctrl_pdata->mode_gpio))
 			gpio_free(ctrl_pdata->mode_gpio);
 	}
 
-exit:
 	return rc;
 }
 
@@ -829,10 +868,33 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 
 	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
+ 	if (mdss_bl_ctrl_by_panel())
+		mdss_dsi_panel_bl_ctrl(pdata, 0);
+
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
 			goto end;
 	}
+
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+	if (s2w_switch)
+		goto touch_on;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+	if (dt2w_switch)
+		goto touch_on;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	if (sovc_switch && sovc_tmp_onoff)
+		goto touch_on;
+#endif
+	goto touch_off;
+
+touch_on:
+	ctrl->off_cmds.cmds[1].payload[0] = 0x11;
+touch_off:
+#endif
 
 	if (ctrl->off_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->off_cmds, CMD_REQ_COMMIT);
