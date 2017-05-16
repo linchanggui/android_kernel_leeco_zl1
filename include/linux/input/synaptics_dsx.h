@@ -62,6 +62,7 @@ struct synaptics_rmi4_platform_data {
 	bool power_down_enable;
 	bool disable_gpios;
 	bool do_lockdown;
+	bool check_build;
 	bool detect_device;
 	bool modify_reso;
 	unsigned irq_gpio;
@@ -77,6 +78,9 @@ struct synaptics_rmi4_platform_data {
 	unsigned disp_maxx;
 	unsigned disp_maxy;
 	unsigned reset_delay;
+	unsigned num_of_tx;
+	unsigned num_of_rx;
+	unsigned num_of_fingers;
 	const char *fw_image_name;
 	unsigned int package_id;
 	int (*gpio_config)(unsigned gpio, bool configure);

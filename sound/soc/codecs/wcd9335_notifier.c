@@ -1,7 +1,7 @@
 /*
- * include/linux/input/scroff_volctr.h
+ * sound/soc/codecs/wcd9335_notifier.c
  *
- * Copyright (c) 2016, jollaman999 <admin@jollaman999.com>
+ * Copyright (c) 2016, jollaman999 <admin@jollaman999>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,17 +18,25 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#ifndef _LINUX_SCROFF_VOLCTR_H
-#define _LINUX_SCROFF_VOLCTR_H
+#include <linux/notifier.h>
+#include <linux/export.h>
 
-#define SOVC_TOUCH_OFF_DELAY	5000	// Touch off delay time (ms)
+static BLOCKING_NOTIFIER_HEAD(tasha_notifier_list);
 
-extern int sovc_switch;
-extern int sovc_tmp_onoff;
-extern bool sovc_force_off;
-extern bool track_changed;
-extern bool sovc_scr_suspended;
+int tasha_register_client(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&tasha_notifier_list, nb);
+}
+EXPORT_SYMBOL(tasha_register_client);
 
-extern void sovc_press_power_key_trigger(int delay);
+int tasha_unregister_client(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&tasha_notifier_list, nb);
+}
+EXPORT_SYMBOL(tasha_unregister_client);
 
-#endif	/* _LINUX_SCROFF_VOLCTR_H */
+int tasha_notifier_call_chain(unsigned long val, void *v)
+{
+	return blocking_notifier_call_chain(&tasha_notifier_list, val, v);
+}
+EXPORT_SYMBOL_GPL(tasha_notifier_call_chain);

@@ -555,6 +555,13 @@ struct mdss_dsi_ctrl_pdata {
 	bool update_phy_timing; /* flag to recalculate PHY timings */
 
 	bool phy_power_off;
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	struct delayed_work mdss_off_work;
+	struct workqueue_struct *mdss_off_workqueue;
+	struct notifier_block tasha_notif;
+#endif
+
 };
 
 struct dsi_status_data {
@@ -624,6 +631,7 @@ int mdss_dsi_pre_clkon_cb(void *priv,
 			  enum mdss_dsi_clk_type clk_type,
 			  enum mdss_dsi_clk_state new_state);
 int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable);
+void mdss_dsi_panel_reset_dsvreg_off_trigger(struct mdss_dsi_ctrl_pdata *ctrl_pdata);
 void mdss_dsi_phy_disable(struct mdss_dsi_ctrl_pdata *ctrl);
 void mdss_dsi_cmd_test_pattern(struct mdss_dsi_ctrl_pdata *ctrl);
 void mdss_dsi_video_test_pattern(struct mdss_dsi_ctrl_pdata *ctrl);

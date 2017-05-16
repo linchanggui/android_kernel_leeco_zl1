@@ -46,6 +46,7 @@
 #include <linux/reboot.h>
 #include <soc/qcom/msm-core.h>
 #include <linux/cpumask.h>
+#include <linux/fb.h>
 #include <linux/suspend.h>
 #include <linux/uaccess.h>
 #include <linux/uio_driver.h>
@@ -92,6 +93,9 @@
 		} \
 	} while (0)
 
+struct notifier_block msm_thermal_fb_notif;
+static int big_core_start;
+
 #define UPDATE_THRESHOLD_SET(_val, _trip) do {		\
 	if (_trip == THERMAL_TRIP_CONFIGURABLE_HI)	\
 		_val |= 1;				\
@@ -117,6 +121,16 @@
 				&cpus[cpu].threshold[_id + 1]); \
 		} \
 	} while (0)
+
+// Cluster thermal threshold for control frequency
+unsigned int temp_threshold;
+unsigned int temp_big_threshold;
+unsigned int temp_step = 2;
+unsigned int temp_count_max = 3;
+module_param(temp_threshold, int, 0644);
+module_param(temp_big_threshold, int, 0644);
+module_param(temp_step, int, 0644);
+module_param(temp_count_max, int, 0644);
 
 static struct msm_thermal_data msm_thermal_info;
 static struct delayed_work check_temp_work, retry_hotplug_work;
@@ -4691,6 +4705,17 @@ static void interrupt_mode_init(void)
 	}
 }
 
+static void msm_thermal_suspend(bool suspend)
+{
+	if (suspend) {
+		interrupt_mode_init();
+		pr_info("suspended\n");
+	} else {
+		schedule_delayed_work(&check_temp_work, 0);
+		pr_info("resumed\n");
+	}
+}
+
 static int __ref set_enabled(const char *val, const struct kernel_param *kp)
 {
 	int ret = 0;
@@ -7100,6 +7125,7 @@ probe_exit:
 static int msm_thermal_dev_exit(struct platform_device *inp_dev)
 {
 	int i = 0;
+	fb_unregister_client(&msm_thermal_fb_notif);
 	uint32_t _cluster = 0;
 	struct cluster_info *cluster_ptr = NULL;
 	struct uio_info *info = dev_get_drvdata(&inp_dev->dev);
@@ -7200,9 +7226,46 @@ static struct platform_driver msm_thermal_device_driver = {
 	.remove = msm_thermal_dev_exit,
 };
 
+static int msm_thermal_fb_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
+
+	if (event == FB_EVENT_BLANK) {
+		blank = evdata->data;
+
+		switch (*blank) {
+		case FB_BLANK_UNBLANK:
+			msm_thermal_suspend(false);
+			break;
+		case FB_BLANK_POWERDOWN:
+			msm_thermal_suspend(true);
+			break;
+		}
+	}
+
+	return 0;
+}
+
+struct notifier_block msm_thermal_fb_notif = {
+	.notifier_call = msm_thermal_fb_notifier_callback,
+};
+
 int __init msm_thermal_device_init(void)
 {
-	return platform_driver_register(&msm_thermal_device_driver);
+	int ret = 0;
+
+	if (fb_register_client(&msm_thermal_fb_notif))
+		pr_info("%s: Failed to register fb notifier.\n",
+			__func__);
+
+	ret = platform_driver_register(&msm_thermal_device_driver);
+	if (ret)
+		pr_info("%s: Failed to register msm_thermal driver.\n",
+			__func__);
+
+	return ret;
 }
 arch_initcall(msm_thermal_device_init);
 

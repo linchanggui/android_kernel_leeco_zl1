@@ -46,17 +46,17 @@
 #include "wcdcal-hwdep.h"
 
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
-#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
-#include <linux/input/sweep2wake.h>
-#endif
-#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
-#include <linux/input/doubletap2wake.h>
-#endif
-#include <linux/input/scroff_volctr.h>
-#define SOVC_TOUCH_OFF_DELAY	5000	// Touch off delay time (ms)
 
-extern int synaptics_rmi4_touch_off_trigger(unsigned int delay);
-static DEFINE_MUTEX(sovc_lock);
+#include <linux/input/scroff_volctr.h>
+#include <linux/wcd9335_notifier.h>
+static DEFINE_MUTEX(tasha_state_lock);
+bool tasha_playing = false;
+EXPORT_SYMBOL(tasha_playing);
+#endif
+
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+bool tasha_mic_detected = false;
+EXPORT_SYMBOL(tasha_mic_detected);
 #endif
 
 #define TASHA_RX_PORT_START_NUMBER  16
@@ -10572,22 +10572,17 @@ static int tasha_startup(struct snd_pcm_substream *substream,
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
 
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+	if (!strcmp(dai->name, "tasha_tx1"))
+		tasha_mic_detected = true;
+#endif
+
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
-	if (!strcmp(dai->name, "tomtom_tx1"))
-		sovc_mic_detected = true;
-
-	track_changed = false;
-	if (!sovc_switch)
-		return 0;
-
-	mutex_lock(&sovc_lock);
-	sovc_tmp_onoff = 1;
-#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
-	dt2w_switch_tmp = 1;
+	mutex_lock(&tasha_state_lock);
+	tasha_notifier_call_chain(TASHA_EVENT_PLAYING, NULL);
+	tasha_playing = true;
+	mutex_unlock(&tasha_state_lock);
 #endif
-	mutex_unlock(&sovc_lock);
-#endif
-
 	return 0;
 }
 
@@ -10597,19 +10592,15 @@ static void tasha_shutdown(struct snd_pcm_substream *substream,
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
 
-#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
-	if (!strcmp(dai->name, "tomtom_tx1"))
-		sovc_mic_detected = false;
-
-	mutex_lock(&sovc_lock);
-	sovc_tmp_onoff = 0;
-#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
-	dt2w_switch_tmp = 0;
+#if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
+	if (!strcmp(dai->name, "tasha_tx1"))
+		tasha_mic_detected = false;
 #endif
-	mutex_unlock(&sovc_lock);
-
-	if (sovc_scr_suspended)
-		synaptics_rmi4_touch_off_trigger(SOVC_TOUCH_OFF_DELAY);
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	mutex_lock(&tasha_state_lock);
+	tasha_notifier_call_chain(TASHA_EVENT_STOPPED, NULL);
+	tasha_playing = false;
+	mutex_unlock(&tasha_state_lock);
 #endif
 }
 

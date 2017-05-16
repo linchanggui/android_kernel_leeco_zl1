@@ -27,12 +27,20 @@
 #include <linux/init.h>
 #include <linux/err.h>
 #include <linux/input/scroff_volctr.h>
+#include <linux/wcd9330_notifier.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/input.h>
 #include <linux/fb.h>
 #include <linux/hrtimer.h>
 #include <asm-generic/cputime.h>
+
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+#include <linux/input/sweep2wake.h>
+#endif
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+#endif
 
 /* ******************* HOW TO WORK *******************
  * == For Volume Control ==
@@ -70,7 +78,7 @@
 /* Version, author, desc, etc */
 #define DRIVER_AUTHOR "jollaman999 <admin@jollaman999.com>"
 #define DRIVER_DESCRIPTION "Screen Off Volume & Track Control for almost any device"
-#define DRIVER_VERSION "3.1"
+#define DRIVER_VERSION "4.3"
 #define LOGTAG "[scroff_volctr]: "
 
 MODULE_AUTHOR(DRIVER_AUTHOR);
@@ -86,7 +94,7 @@ MODULE_LICENSE("GPLv2");
 #define SOVC_TIME_GAP		250	// Ignore touch after this time (ms)
 #define SOVC_VOL_REEXEC_DELAY	250	// Re-exec delay for volume control (ms)
 #define SOVC_TRACK_REEXEC_DELAY	4000	// Re-exec delay for track control (ms)
-#define SOVC_AUTO_OFF_DELAY	4000	// Touch screen will be turned off when user pressing the screen (ms)
+#define SOVC_AUTO_OFF_DELAY	2500	// Touch screen will be turned off when user pressing the screen (ms)
 #define SOVC_KEY_PRESS_DUR	100	// Key press duration (ms)
 #define SOVC_VIB_STRENGTH	20	// Vibrator strength
 
@@ -94,7 +102,6 @@ MODULE_LICENSE("GPLv2");
 int sovc_switch = SOVC_DEFAULT;
 int sovc_tmp_onoff = 0;
 bool sovc_force_off = false;
-bool sovc_mic_detected = false;
 bool track_changed = false;
 bool sovc_scr_suspended = false;
 static int sovc_auto_off_delay = SOVC_AUTO_OFF_DELAY;
@@ -103,17 +110,24 @@ static int touch_x = 0, touch_y = 0;
 static int prev_x = 0, prev_y = 0;
 static bool is_new_touch_x = false, is_new_touch_y = false;
 static bool is_touching = false;
+static bool sovc_auto_off_scheduled = false;
 static struct input_dev *sovc_input;
 static DEFINE_MUTEX(keyworklock);
+static DEFINE_MUTEX(touch_off_lock);
+static DEFINE_MUTEX(auto_off_schedule_lock);
+static DEFINE_MUTEX(a2dp_lock);
 static struct workqueue_struct *sovc_volume_input_wq;
 static struct workqueue_struct *sovc_track_input_wq;
 static struct work_struct sovc_volume_input_work;
 static struct work_struct sovc_track_input_work;
+extern bool tomtom_mic_detected;
+extern bool tomtom_playing;
+
+static void touch_off(void);
+static void unregister_sovc(void);
 
 static bool registered = false;
 static DEFINE_MUTEX(reg_lock);
-
-extern int synaptics_rmi4_touch_off_trigger(unsigned int delay);
 
 enum CONTROL {
 	NO_CONTROL,
@@ -146,6 +160,27 @@ static int __init read_sovc_cmdline(char *sovc)
 	return 1;
 }
 __setup("sovc=", read_sovc_cmdline);
+
+/* Turn off the touch screen when user pressing the touch screen */
+static void sovc_auto_off_check(struct work_struct *sovc_auto_off_check_work)
+{
+	if (!is_new_touch_x && !is_new_touch_y)
+		return;
+
+	touch_off();
+}
+static DECLARE_DELAYED_WORK(sovc_auto_off_check_work, sovc_auto_off_check);
+
+/* Schedule delayed work of sovc_auto_off_check_work */
+static void sovc_auto_off_schedule(void)
+{
+	if (sovc_auto_off_scheduled)
+		return;
+
+	sovc_auto_off_scheduled = true;
+	schedule_delayed_work(&sovc_auto_off_check_work,
+				msecs_to_jiffies(sovc_auto_off_delay));
+}
 
 /* Key work func */
 static void scroff_volctr_key(struct work_struct *scroff_volctr_key_work)
@@ -207,8 +242,11 @@ static void scroff_volctr_key(struct work_struct *scroff_volctr_key_work)
 #endif
 	mutex_unlock(&keyworklock);
 
-	if (is_touching)
+	if (is_touching) {
+		// It should be canceled to prevent to turn off the touchscreen.
+		cancel_delayed_work(&sovc_auto_off_check_work);
 		scroff_volctr_key_delayed_trigger();
+	}
 }
 static DECLARE_DELAYED_WORK(scroff_volctr_key_work, scroff_volctr_key);
 
@@ -244,6 +282,7 @@ static void scroff_volctr_reset(void)
 	is_touching = false;
 	is_new_touch_x = false;
 	is_new_touch_y = false;
+	sovc_auto_off_scheduled = false;
 	control = NO_CONTROL;
 }
 
@@ -253,6 +292,11 @@ static void new_touch_x(int x)
 	touch_time_pre_x = ktime_to_ms(ktime_get());
 	is_new_touch_x = true;
 	prev_x = x;
+
+	mutex_lock(&auto_off_schedule_lock);
+	sovc_auto_off_schedule();
+	mutex_unlock(&auto_off_schedule_lock);
+
 }
 
 static void new_touch_y(int y)
@@ -260,6 +304,10 @@ static void new_touch_y(int y)
 	touch_time_pre_y = ktime_to_ms(ktime_get());
 	is_new_touch_y = true;
 	prev_y = y;
+
+	mutex_lock(&auto_off_schedule_lock);
+	sovc_auto_off_schedule();
+	mutex_unlock(&auto_off_schedule_lock);
 }
 
 /* exec key control */
@@ -273,16 +321,23 @@ static void exec_key(int key)
 /* Turn off the touch screen */
 static void touch_off(void)
 {
+	mutex_lock(&touch_off_lock);
+
 	if (sovc_force_off)
-		return;
+		goto out;
 
 	sovc_force_off = true;
-	synaptics_rmi4_touch_off_trigger(0);
+	unregister_sovc();
+	tomtom_notifier_call_chain(TOMTOM_EVENT_STOPPED, NULL);
 
 	// Vibrate when action performed
 #ifdef CONFIG_QPNP_HAPTIC
-	qpnp_hap_td_enable(SOVC_VIB_STRENGTH * 4);
+	qpnp_hap_td_enable(SOVC_VIB_STRENGTH * 3);
+	msleep(50);
+	qpnp_hap_td_enable(SOVC_VIB_STRENGTH * 3);
 #endif
+out:
+	mutex_unlock(&touch_off_lock);
 }
 
 /* scroff_volctr volume function */
@@ -290,19 +345,16 @@ static void sovc_volume_input_callback(struct work_struct *unused)
 {
 	s64 time;
 
-	if (!is_touching) {
-		if (!is_new_touch_y)
-			new_touch_y(touch_y);
+	if (!is_new_touch_y)
+		new_touch_y(touch_y);
 
-		time = ktime_to_ms(ktime_get()) - touch_time_pre_y;
+	time = ktime_to_ms(ktime_get()) - touch_time_pre_y;
 
-		if (time > 0 && time < SOVC_TIME_GAP) {
-			if (prev_y - touch_y > SOVC_VOL_FEATHER) // Volume Up (down->up)
-				exec_key(VOL_UP);
-			else if (touch_y - prev_y > SOVC_VOL_FEATHER) // Volume Down (up->down)
-				exec_key(VOL_DOWN);
-		} else if (time > sovc_auto_off_delay)
-			touch_off();
+	if (time > 0 && time < SOVC_TIME_GAP) {
+		if (prev_y - touch_y > SOVC_VOL_FEATHER) // Volume Up (down->up)
+			exec_key(VOL_UP);
+		else if (touch_y - prev_y > SOVC_VOL_FEATHER) // Volume Down (up->down)
+			exec_key(VOL_DOWN);
 	}
 }
 
@@ -311,19 +363,16 @@ static void sovc_track_input_callback(struct work_struct *unused)
 {
 	s64 time;
 
-	if (!is_touching) {
-		if (!is_new_touch_x)
-			new_touch_x(touch_x);
+	if (!is_new_touch_x)
+		new_touch_x(touch_x);
 
-		time = ktime_to_ms(ktime_get()) - touch_time_pre_x;
+	time = ktime_to_ms(ktime_get()) - touch_time_pre_x;
 
-		if (time > 0 && time < SOVC_TIME_GAP) {
-			if (prev_x - touch_x > SOVC_TRACK_FEATHER) // Track Next (right->left)
-				exec_key(TRACK_NEXT);
-			else if (touch_x - prev_x > SOVC_TRACK_FEATHER) // Track Previous (left->right)
-				exec_key(TRACK_PREVIOUS);
-		} else if (time > sovc_auto_off_delay)
-			touch_off();
+	if (time > 0 && time < SOVC_TIME_GAP) {
+		if (prev_x - touch_x > SOVC_TRACK_FEATHER) // Track Next (right->left)
+			exec_key(TRACK_NEXT);
+		else if (touch_x - prev_x > SOVC_TRACK_FEATHER) // Track Previous (left->right)
+			exec_key(TRACK_PREVIOUS);
 	}
 }
 
@@ -343,8 +392,10 @@ static int sovc_input_common_event(struct input_handle *handle, unsigned int typ
 			break;
 
 		case ABS_MT_TRACKING_ID:
-			if (value == 0xffffffff)
+			if (value == 0xffffffff) {
+				cancel_delayed_work(&sovc_auto_off_check_work);
 				scroff_volctr_reset();
+			}
 			break;
 
 		default:
@@ -361,6 +412,9 @@ static void sovc_volume_input_event(struct input_handle *handle, unsigned int ty
 
 	out = sovc_input_common_event(handle, type, code, value);
 	if (out)
+		return;
+
+	if (is_touching)
 		return;
 
 	/* You can debug here with 'adb shell getevent -l' command. */
@@ -384,9 +438,17 @@ static void sovc_track_input_event(struct input_handle *handle, unsigned int typ
 	if (out)
 		return;
 
+	if (is_touching)
+		return;
+
 	/* You can debug here with 'adb shell getevent -l' command. */
 	switch(code) {
 		case ABS_MT_POSITION_X:
+#ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
+			// Ignore to change track when S2W is enabled.
+			if (s2w_switch == 1)
+				break;
+#endif
 			touch_x = value;
 			queue_work(sovc_track_input_wq, &sovc_track_input_work);
 			break;
@@ -481,6 +543,8 @@ static struct input_handler sovc_track_input_handler = {
 static int register_sovc(void)
 {
 	int rc = 0;
+
+	scroff_volctr_reset();
 
 	mutex_lock(&reg_lock);
 
@@ -583,14 +647,27 @@ static ssize_t sovc_scroff_volctr_show(struct device *dev,
 static ssize_t sovc_scroff_volctr_dump(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
-	if ((buf[0] == '0' || buf[0] == '1') && buf[1] == '\n')
-		if (sovc_switch != buf[0] - '0')
-			sovc_switch = buf[0] - '0';
+	int rc, val;
 
-	if (sovc_switch)
+	rc = kstrtoint(buf, 10, &val);
+	if (rc)
+		return -EINVAL;
+
+	if (val == 0 || val == 1) {
+		if (sovc_switch != val)
+			sovc_switch = val;
+	} else
+		return -EINVAL;
+
+	if (sovc_switch && sovc_tmp_onoff && sovc_scr_suspended && !tomtom_mic_detected)
 		register_sovc();
 	else
 		unregister_sovc();
+
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+	if (!dt2w_switch && !dt2s_switch && !sovc_switch)
+		unregister_dt2w();
+#endif
 
 	return count;
 }
@@ -611,19 +688,47 @@ static ssize_t sovc_scroff_volctr_temp_show(struct device *dev,
 static ssize_t sovc_scroff_volctr_temp_dump(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
-	int value_changed = 0;
+	int rc, val;
 
-	if ((buf[0] == '0' || buf[0] == '1') && buf[1] == '\n') {
-		if (sovc_tmp_onoff != buf[0] - '0') {
-			value_changed = 1;
-			sovc_tmp_onoff = buf[0] - '0';
-		}
-	}
+	mutex_lock(&a2dp_lock);
+
+	rc = kstrtoint(buf, 10, &val);
+	if (rc)
+		goto invalid_value;
+
+	if (val == 0 || val == 1) {
+		if (val == sovc_tmp_onoff)
+			goto out;
+		if (val == 0 && track_changed)
+			goto out;
+		sovc_tmp_onoff = val;
+	} else
+		goto invalid_value;
 
 	if (sovc_tmp_onoff)
 		track_changed = false;
 
+	if (sovc_switch && sovc_scr_suspended) {
+		if (sovc_tmp_onoff) {
+			if (tomtom_mic_detected)
+				unregister_sovc();
+			else
+				register_sovc();
+		} else {
+			mutex_lock(&touch_off_lock);
+			unregister_sovc();
+			tomtom_notifier_call_chain(TOMTOM_EVENT_STOPPED, NULL);
+			mutex_unlock(&touch_off_lock);
+		}
+	} else
+		unregister_sovc();
+
+out:
+	mutex_unlock(&a2dp_lock);
 	return count;
+invalid_value:
+	mutex_unlock(&a2dp_lock);
+	return -EINVAL;
 }
 
 static DEVICE_ATTR(scroff_volctr_temp, (S_IWUSR|S_IRUGO),
@@ -642,15 +747,16 @@ static ssize_t sovc_auto_off_delay_show(struct device *dev,
 static ssize_t sovc_auto_off_delay_dump(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
-	int ret;
-	int val;
+	int rc, val;
 
-	ret = sscanf(buf, "%d", &val);
-	if (ret != 1)
+	rc = kstrtoint(buf, 10, &val);
+	if (rc)
 		return -EINVAL;
 
 	if (val >= 1000 && val <= 60000)
 		sovc_auto_off_delay = val;
+	else
+		return -EINVAL;
 
 	return count;
 }
@@ -691,16 +797,16 @@ static int sovc_fb_notifier_callback(struct notifier_block *self,
 
 		switch (*blank) {
 		case FB_BLANK_UNBLANK:
+		case FB_BLANK_VSYNC_SUSPEND:
 			sovc_scr_suspended = false;
+			sovc_force_off = false;
+			cancel_delayed_work(&sovc_auto_off_check_work);
 			unregister_sovc();
 			break;
 		case FB_BLANK_POWERDOWN:
 			sovc_scr_suspended = true;
-			if (sovc_force_off)
-				unregister_sovc();
-
 			if (sovc_switch && (track_changed || sovc_tmp_onoff)) {
-				if (sovc_mic_detected) {
+				if (tomtom_mic_detected) {
 					unregister_sovc();
 					break;
 				}
@@ -715,6 +821,30 @@ static int sovc_fb_notifier_callback(struct notifier_block *self,
 
 struct notifier_block sovc_fb_notif = {
 	.notifier_call = sovc_fb_notifier_callback,
+};
+
+static int sovc_tomtom_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	if (!sovc_switch)
+		return 0;
+
+	switch (event) {
+	case TOMTOM_EVENT_PLAYING:
+		track_changed = false;
+		sovc_tmp_onoff = 1;
+		break;
+	case TOMTOM_EVENT_STOPPED:
+		if (!track_changed && !sovc_force_off)
+			sovc_tmp_onoff = 0;
+		break;
+	}
+
+	return 0;
+}
+
+struct notifier_block sovc_tomtom_notif = {
+	.notifier_call = sovc_tomtom_notifier_callback,
 };
 
 /*
@@ -760,6 +890,10 @@ static int __init scroff_volctr_init(void)
 	if (rc) {
 		pr_warn("%s: fb register failed\n", __func__);
 	}
+	rc = tomtom_register_client(&sovc_tomtom_notif);
+	if (rc) {
+		pr_warn("%s: tasha register failed\n", __func__);
+	}
 
 	rc = sysfs_create_file(android_touch_kobj, &dev_attr_scroff_volctr.attr);
 	if (rc) {
@@ -795,6 +929,7 @@ static void __exit scroff_volctr_exit(void)
 	input_unregister_device(sovc_input);
 	input_free_device(sovc_input);
 	fb_unregister_client(&sovc_fb_notif);
+	tomtom_unregister_client(&sovc_tomtom_notif);
 }
 
 module_init(scroff_volctr_init);

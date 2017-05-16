@@ -310,6 +310,7 @@ obj-$(CONFIG_SND_SOC_UDA1380)	+= snd-soc-uda1380.o
 obj-$(CONFIG_SND_SOC_WCD9320)	+= snd-soc-wcd9320.o
 obj-$(CONFIG_SND_SOC_WCD9330)	+= snd-soc-wcd9330.o
 obj-$(CONFIG_SND_SOC_WCD9335)	+= snd-soc-wcd9335.o
+obj-$(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)	+= wcd9335_notifier.o
 obj-$(CONFIG_SND_SOC_ES9018)	+= snd-soc-es9018.o
 obj-$(CONFIG_SND_SOC_TFA98XX)	+=snd-soc-tfa98xx.o
 obj-$(CONFIG_AUDIO_EXT_CLK)	+= audio-ext-clock.o

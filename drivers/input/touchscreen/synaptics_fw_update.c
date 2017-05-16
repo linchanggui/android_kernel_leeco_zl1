@@ -723,6 +723,18 @@ static enum flash_area fwu_go_nogo(void)
 		goto exit;
 	}
 
+	retval = fwu_read_f01_device_status(&f01_device_status);
+	if (retval < 0) {
+		flash_area = NONE;
+		goto exit;
+	}
+
+	/* Force update firmware when device is in bootloader mode */
+	if (f01_device_status.flash_prog) {
+		dev_info(&i2c_client->dev, "%s: In flash prog mode\n", __func__);
+		flash_area = UI_FIRMWARE;
+		goto exit;
+	}
 	if (img->is_contain_build_info) {
 		/* if package id does not match, do not update firmware */
 		fwu->fn_ptr->read(fwu->rmi4_data,
@@ -760,21 +772,6 @@ static enum flash_area fwu_go_nogo(void)
 			fwu->config_block_count * fwu->block_size,
 			img->config_size);
 		flash_area = NONE;
-		goto exit;
-	}
-
-	retval = fwu_read_f01_device_status(&f01_device_status);
-	if (retval < 0) {
-		flash_area = NONE;
-		goto exit;
-	}
-
-	/* Force update firmware when device is in bootloader mode */
-	if (f01_device_status.flash_prog) {
-		dev_info(&i2c_client->dev,
-			"%s: In flash prog mode\n",
-			__func__);
-		flash_area = UI_FIRMWARE;
 		goto exit;
 	}
 
@@ -1697,6 +1694,10 @@ static ssize_t fwu_sysfs_store_image(struct file *data_file,
 		struct kobject *kobj, struct bin_attribute *attributes,
 		char *buf, loff_t pos, size_t count)
 {
+	if (!fwu->ext_data_source) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot use this without setting imagesize!\n");
+		return -EAGAIN;
+	}
 	memcpy((void *)(&fwu->ext_data_source[fwu->data_pos]),
 			(const void *)buf,
 			count);
@@ -1837,6 +1838,16 @@ static ssize_t fwu_sysfs_write_lockdown_store(struct device *dev,
 		goto exit;
 	}
 
+	if (!fwu->ext_data_source) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot use this without loading image in manual way!\n");
+		return -EAGAIN;
+	}
+
+	if (fwu->rmi4_data->suspended == true) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot lockdown while device is in suspend\n");
+		return -EBUSY;
+	}
+
 	retval = fwu_start_write_lockdown();
 	if (retval < 0) {
 		dev_err(&rmi4_data->i2c_client->dev,
@@ -1855,6 +1866,20 @@ exit:
 	return retval;
 }
 
+static ssize_t fwu_sysfs_check_fw_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int input = 0;
+	if (sscanf(buf, "%u", &input) != 1)
+		return -EINVAL;
+	if (fwu->rmi4_data->suspended == true) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot trigger fw check while device is in suspend\n");
+		return -EBUSY;
+	}
+	if (input)
+		queue_delayed_work(fwu->fwu_workqueue, &fwu->fwu_work, 0);
+	return count;
+}
+
 static ssize_t fwu_sysfs_write_config_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -1862,13 +1887,21 @@ static ssize_t fwu_sysfs_write_config_store(struct device *dev,
 	unsigned int input;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
-	retval = kstrtouint(buf, 10, &input);
-	if (retval)
+	if (sscanf(buf, "%u", &input) != 1) {
+		retval = -EINVAL;
 		goto exit;
-
+	}
 	if (input != 1) {
 		retval = -EINVAL;
 		goto exit;
+	}
+	if (!fwu->ext_data_source) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot use this without loading image in manual way!\n");
+		return -EAGAIN;
+	}
+	if (fwu->rmi4_data->suspended == true) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot write config while device is in suspend\n");
+		return -EBUSY;
 	}
 
 	retval = fwu_start_write_config();
@@ -1894,13 +1927,14 @@ static ssize_t fwu_sysfs_read_config_store(struct device *dev,
 	unsigned int input;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
-	retval = kstrtouint(buf, 10, &input);
-	if (retval)
-		return retval;
-
+	if (sscanf(buf, "%u", &input) != 1)
+		return -EINVAL;
 	if (input != 1)
 		return -EINVAL;
-
+	if (fwu->rmi4_data->suspended == true) {
+		dev_err(&fwu->rmi4_data->i2c_client->dev, "Cannot read config while device is in suspend\n");
+		return -EBUSY;
+	}
 	retval = fwu_do_read_config();
 	if (retval < 0) {
 		dev_err(&rmi4_data->i2c_client->dev,

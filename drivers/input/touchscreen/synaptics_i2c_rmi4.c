@@ -48,6 +48,7 @@
 #endif
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
 #include <linux/input/scroff_volctr.h>
+#include <linux/wcd9335_notifier.h>
 #endif
 
 #define DRIVER_NAME "synaptics_rmi4_i2c"
@@ -124,7 +125,11 @@ enum device_status {
 #define F11_MAX_Y		4096
 #define F12_MAX_X		65536
 #define F12_MAX_Y		65536
-
+/*
+#ifdef CONFIG_THERMAL_MONITOR
+extern void msm_thermal_suspend(bool suspend);
+#endif
+*/
 /* lcg */
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 #define RMI4_WL_HOLD_TIME_MS 1000
@@ -133,10 +138,15 @@ static bool scr_suspended = false;
 static bool irq_wake_enabled = false;
 static s64 wake_lock_start_time = 0;
 
+extern bool tasha_mic_detected;
+
 static bool is_touch_on(void)
 {
+	if (tasha_mic_detected)
+		return false;
+
 #ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
-	if (s2w_switch)
+	if (s2w_switch == 1)
 		return true;
 #endif
 #ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
@@ -147,17 +157,19 @@ static bool is_touch_on(void)
 	if (sovc_force_off)
 		return false;
 
-	if (sovc_switch && (track_changed || sovc_tmp_onoff)) {
-		if (sovc_mic_detected)
-			return false;
+	if (sovc_switch && (track_changed || sovc_tmp_onoff))
+
 		return true;
-	}
 #endif
 	return false;
 }
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+
 static void synaptics_rmi4_touch_off(struct work_struct *work);
+
+#endif
 
 static int synaptics_rmi4_i2c_read(struct synaptics_rmi4_data *rmi4_data,
 		unsigned short addr, unsigned char *data,
@@ -202,6 +214,10 @@ static void synaptics_rmi4_early_suspend(struct early_suspend *h);
 static void synaptics_rmi4_late_resume(struct early_suspend *h);
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static int tasha_notifier_callback(struct notifier_block *self, unsigned long event, void *data);
+#endif
+
 static ssize_t synaptics_rmi4_f01_reset_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count);
 
@@ -230,6 +246,9 @@ static ssize_t synaptics_rmi4_flipy_show(struct device *dev,
 		struct device_attribute *attr, char *buf);
 
 static ssize_t synaptics_rmi4_flipy_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+
+static ssize_t synaptics_rmi4_reg_control_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count);
 
 static int synaptics_rmi4_capacitance_button_map(
@@ -510,6 +529,8 @@ static struct device_attribute attrs[] = {
 static bool exp_fn_inited;
 static struct mutex exp_fn_list_mutex;
 static struct list_head exp_fn_list;
+static struct mutex suspended_mutex;
+static struct mutex suspend_resume_lock;
 
 #if defined(CONFIG_SECURE_TOUCH)
 static int synaptics_secure_touch_clk_prepare_enable(
@@ -811,6 +832,20 @@ static void configure_sleep(struct synaptics_rmi4_data *rmi4_data)
 }
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static void configure_sleep_tasha(struct synaptics_rmi4_data *rmi4_data)
+{
+	int retval = 0;
+
+	rmi4_data->tasha_notif.notifier_call = tasha_notifier_callback;
+
+	retval = tasha_register_client(&rmi4_data->tasha_notif);
+	if (retval)
+		pr_info("Unable to register tasha_notifier: %d\n", retval);
+	return;
+}
+#endif
+
 static ssize_t synaptics_rmi4_f01_reset_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -818,13 +853,15 @@ static ssize_t synaptics_rmi4_f01_reset_store(struct device *dev,
 	unsigned int reset;
 	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
 
-	retval = kstrtouint(buf, 10, &reset);
-	if (retval)
-		return retval;
-
+	if (sscanf(buf, "%u", &reset) != 1)
+		return -EINVAL;
 	if (reset != 1)
 		return -EINVAL;
 
+	if (rmi4_data->suspended == true) {
+		dev_err(dev, "%s: cannot reset while device is in suspend\n", __func__);
+		return -EBUSY;
+	}
 	retval = synaptics_rmi4_reset_device(rmi4_data);
 	if (retval < 0) {
 		dev_err(dev,
@@ -1000,6 +1037,93 @@ static ssize_t synaptics_rmi4_flipy_store(struct device *dev,
 	return count;
 }
 
+static ssize_t synaptics_rmi4_reg_control_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned char string[7];
+	char reg_s[11];
+	char offset_s[11];
+	char value_s[11];
+	unsigned reg;
+	unsigned offset = 0;
+	int value;
+	int ret = 0;
+	int num_of_params;
+	u8 data[MAX_OFFSET_SIZE];
+
+	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
+
+	num_of_params = sscanf(buf, "%6s %10s %10s %10s",
+				string, reg_s, offset_s, value_s);
+
+	if (kstrtoint(reg_s, 0, &reg) != 0) {
+		dev_err(dev, "Invalid parameter\n");
+		return count;
+	}
+
+	if (num_of_params > 2) {
+		if (kstrtoint(offset_s, 0, &offset) != 0)
+			offset = 0;
+
+		if (offset >= MAX_OFFSET_SIZE) {
+			dev_err(dev, "Invalid offset (should be < %d)\n",
+					MAX_OFFSET_SIZE);
+			return count;
+		}
+	}
+
+	if (num_of_params > 3) {
+		if (kstrtoint(value_s, 0, &value) != 0)
+			value = 0;
+	}
+
+	if (!rmi4_data->suspended) {
+		if (!strncmp(string, "read", 4)) {
+			ret = synaptics_rmi4_i2c_read(rmi4_data,
+					reg, data, offset+1);
+			if (ret < 0)
+				dev_err(dev,
+					"cannot read register[0x%x:%d]\n",
+					offset, reg);
+			else
+				pr_info("register[0x%x:%d] = 0x%x\n",
+						reg, offset, data[offset]);
+		} else if (!strncmp(string, "write", 4)) {
+			if (num_of_params != 4) {
+				value = offset;
+				offset = 0;
+			}
+
+			ret = synaptics_rmi4_i2c_read(rmi4_data, reg,
+							data, offset+1);
+			if (ret < 0) {
+				dev_err(dev,
+					"cannot read register[0x%x:%d]\n",
+					reg, offset);
+				return count;
+			}
+
+			data[offset] = value;
+			ret = synaptics_rmi4_i2c_write(rmi4_data, reg,
+							data, offset+1);
+			if (ret < 0)
+				dev_err(dev,
+					"cannot write register[0x%x]\n", reg);
+			else
+				pr_info("register[0x%x:%d] is set to 0x%x\n", reg, offset, data[offset]);
+		} else {
+			pr_info("Usage: echo [read | write] reg_num [offset] value > ic_rw\n");
+			pr_info(" - reg_num : register address\n");
+			pr_info(" - offset [read/write] : offset of bulk register access (def: 0)\n");
+			pr_info(" - value [write] : set value into reg_num:offset\n");
+		}
+	} else {
+		pr_info("state=[suspend]. we cannot use I2C, now\n");
+	}
+
+	return count;
+}
+
  /**
  * synaptics_rmi4_set_page()
  *
@@ -1116,21 +1240,23 @@ static int synaptics_rmi4_i2c_write(struct synaptics_rmi4_data *rmi4_data,
 {
 	int retval;
 	unsigned char retry;
-	unsigned char buf[length + 1];
-	struct i2c_msg msg[] = {
-		{
-			.addr = rmi4_data->i2c_client->addr,
-			.flags = 0,
-			.len = length + 1,
-			.buf = buf,
-		}
-	};
+	unsigned char *buf;
+	struct i2c_msg msg[1];
+	buf = kzalloc(length + 1, GFP_KERNEL);
+	if (!buf) {
+		dev_err(&rmi4_data->i2c_client->dev, "%s: Failed to alloc mem for buffer\n", __func__);
+		return -ENOMEM;
+	}
 
 	mutex_lock(&(rmi4_data->rmi4_io_ctrl_mutex));
 
 	retval = synaptics_rmi4_set_page(rmi4_data, addr);
 	if (retval != PAGE_SELECT_LEN)
 		goto exit;
+	msg[0].addr = rmi4_data->i2c_client->addr;
+	msg[0].flags = 0;
+	msg[0].len = length + 1;
+	msg[0].buf = buf;
 
 	buf[0] = addr & MASK_8BIT;
 	memcpy(&buf[1], &data[0], length);
@@ -1155,6 +1281,7 @@ static int synaptics_rmi4_i2c_write(struct synaptics_rmi4_data *rmi4_data,
 
 exit:
 	mutex_unlock(&(rmi4_data->rmi4_io_ctrl_mutex));
+	kfree(buf);
 
 	return retval;
 }
@@ -1235,6 +1362,9 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 			num_of_finger_status_regs);
 	if (retval < 0)
 		return 0;
+
+	input_event(rmi4_data->input_dev, EV_SYN, SYN_TIME_SEC, ktime_to_timespec(rmi4_data->timestamp).tv_sec);
+	input_event(rmi4_data->input_dev, EV_SYN, SYN_TIME_NSEC, ktime_to_timespec(rmi4_data->timestamp).tv_nsec);
 
 	for (finger = 0; finger < fingers_supported; finger++) {
 		reg_index = finger / 4;
@@ -1366,6 +1496,9 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		return 0;
 
 	data = (struct synaptics_rmi4_f12_finger_data *)fhandler->data;
+
+	input_event(rmi4_data->input_dev, EV_SYN, SYN_TIME_SEC, ktime_to_timespec(rmi4_data->timestamp).tv_sec);
+	input_event(rmi4_data->input_dev, EV_SYN, SYN_TIME_NSEC, ktime_to_timespec(rmi4_data->timestamp).tv_nsec);
 
 	for (finger = 0; finger < fingers_to_process; finger++) {
 		finger_data = data + finger;
@@ -1979,6 +2112,15 @@ static int synaptics_rmi4_parse_dt(struct device *dev,
 		}
 	}
 
+	rc = of_property_read_u32(np, "synaptics,num-of-tx", &temp_val);
+	if (!rc)
+		rmi4_pdata->num_of_tx = temp_val;
+	rc = of_property_read_u32(np, "synaptics,num-of-rx", &temp_val);
+	if (!rc)
+		rmi4_pdata->num_of_rx = temp_val;
+	rc = of_property_read_u32(np, "synaptics,num-of-fingers", &temp_val);
+	if (!rc)
+		rmi4_pdata->num_of_fingers = temp_val;
 	return 0;
 }
 #else
@@ -3443,6 +3585,89 @@ err_irq_gpio_req:
 	return retval;
 }
 
+static void synaptics_rmi4_init_work(struct work_struct *work)
+{
+	struct synaptics_rmi4_data *rmi4_data =
+			container_of(work, struct synaptics_rmi4_data, init_work);
+	struct device *dev = &rmi4_data->input_dev->dev;
+	int retval;
+
+	synaptics_secure_touch_stop(rmi4_data, 1);
+
+	retval = synaptics_rmi4_regulator_lpm(rmi4_data, false);
+	if (retval < 0) {
+		dev_err(dev, "Failed to enter active power mode\n");
+		return;
+	}
+
+	if (rmi4_data->board->disable_gpios) {
+		if (rmi4_data->ts_pinctrl) {
+			retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
+					rmi4_data->pinctrl_state_active);
+			if (retval < 0)
+				dev_err(dev, "failed to select default pinctrl state\n");
+		}
+
+		retval = synaptics_rmi4_gpio_configure(rmi4_data, true);
+		if (retval < 0) {
+			dev_err(dev, "Failed to put gpios in active state\n");
+			goto err_gpio_configure;
+		}
+	}
+
+	rmi4_data->touch_stopped = false;
+	if (rmi4_data->board->power_down_enable && rmi4_data->board->pon_delay)
+		usleep(rmi4_data->board->pon_delay * 1000);
+
+	synaptics_rmi4_sensor_wake(rmi4_data);
+	retval = synaptics_rmi4_check_configuration(rmi4_data);
+	if (retval < 0) {
+		dev_err(&(rmi4_data->input_dev->dev),
+				"Failed to check configuration\n");
+		goto err_check_configuration;
+	}
+
+	synaptics_rmi4_irq_enable(rmi4_data, true);
+
+	mutex_lock(&suspended_mutex);
+	rmi4_data->suspended = false;
+	mutex_unlock(&suspended_mutex);
+
+	return;
+
+err_check_configuration:
+	synaptics_rmi4_irq_enable(rmi4_data, false);
+	rmi4_data->touch_stopped = true;
+	synaptics_rmi4_sensor_sleep(rmi4_data);
+
+	if (rmi4_data->board->disable_gpios) {
+		if (rmi4_data->ts_pinctrl) {
+			retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
+					rmi4_data->pinctrl_state_suspend);
+			if (retval < 0)
+				dev_err(dev, "failed to select idle pinctrl state\n");
+		}
+
+		synaptics_rmi4_gpio_configure(rmi4_data, false);
+	}
+	synaptics_rmi4_regulator_lpm(rmi4_data, true);
+	wake_up(&rmi4_data->wait);
+
+	return;
+
+err_gpio_configure:
+	if (rmi4_data->ts_pinctrl) {
+		retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
+					rmi4_data->pinctrl_state_suspend);
+		if (retval < 0)
+			pr_err("failed to select idle pinctrl state\n");
+	}
+	synaptics_rmi4_regulator_lpm(rmi4_data, true);
+	wake_up(&rmi4_data->wait);
+
+	return;
+}
+
  /**
  * synaptics_rmi4_probe()
  *
@@ -3629,6 +3854,12 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	else
 		rmi4_data->disp_miny = 0;
 
+	if (!rmi4_data->max_touch_width) {
+		rmi4_data->max_touch_width = max(rmi4_data->board->num_of_rx, rmi4_data->board->num_of_tx);
+	}
+	if (!rmi4_data->num_of_fingers)
+		rmi4_data->num_of_fingers = rmi4_data->board->num_of_fingers;
+
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_POSITION_X, rmi4_data->disp_minx,
 			rmi4_data->disp_maxx, 0, 0);
@@ -3682,20 +3913,22 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 
 	configure_sleep(rmi4_data);
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	configure_sleep_tasha(rmi4_data);
+#endif
+
 	if (!exp_fn_inited) {
 		mutex_init(&exp_fn_list_mutex);
 		INIT_LIST_HEAD(&exp_fn_list);
 		exp_fn_inited = 1;
 	}
-
+	mutex_init(&suspended_mutex);
+	mutex_init(&suspend_resume_lock);
 /* lcg */
-	rmi4_data->det_workqueue =
-			alloc_workqueue("rmi_det_workqueue",
-				WQ_UNBOUND | WQ_HIGHPRI | __WQ_ORDERED, 1);
+	rmi4_data->det_workqueue = alloc_workqueue("rmi_det_workqueue", WQ_UNBOUND | WQ_HIGHPRI | __WQ_ORDERED, 1);
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
 	rmi4_data->touch_off_workqueue =
-			alloc_workqueue("rmi_touch_off_workqueue",
-				WQ_UNBOUND | WQ_HIGHPRI | __WQ_ORDERED, 1);
+			alloc_workqueue("rmi_touch_off_workqueue", WQ_UNBOUND | WQ_HIGHPRI | __WQ_ORDERED, 1);
 #endif
 
 	INIT_DELAYED_WORK(&rmi4_data->det_work,
@@ -3708,20 +3941,9 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	INIT_DELAYED_WORK(&rmi4_data->touch_off_work,
 			synaptics_rmi4_touch_off);
 #endif
-	rmi4_data->touch_off_triggered = false;
-	rmi4_data->irq = gpio_to_irq(platform_data->irq_gpio);
 
-	retval = request_threaded_irq(rmi4_data->irq, NULL,
-		synaptics_rmi4_irq, platform_data->irq_flags,
-		DRIVER_NAME, rmi4_data);
-	rmi4_data->irq_enabled = true;
-
-	if (retval < 0) {
-		dev_err(&client->dev,
-				"%s: Failed to create irq thread\n",
-				__func__);
-		goto err_enable_irq;
-	}
+	INIT_WORK(&rmi4_data->recovery_work, synaptics_rmi4_recover_work);
+	INIT_WORK(&rmi4_data->init_work, synaptics_rmi4_init_work);
 
 	rmi4_data->dir = debugfs_create_dir(DEBUGFS_DIR_NAME, NULL);
 	if (rmi4_data->dir == NULL || IS_ERR(rmi4_data->dir)) {
@@ -3754,14 +3976,22 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	}
 
 	synaptics_rmi4_sensor_wake(rmi4_data);
+	synaptics_rmi4_set_configuration(rmi4_data);
 
-	retval = synaptics_rmi4_irq_enable(rmi4_data, true);
+	rmi4_data->irq = gpio_to_irq(platform_data->irq_gpio);
+
+	retval = request_threaded_irq(rmi4_data->irq, NULL,
+		synaptics_rmi4_irq, platform_data->irq_flags,
+		DRIVER_NAME, rmi4_data);
+	rmi4_data->irq_enabled = true;
+
 	if (retval < 0) {
 		dev_err(&client->dev,
-			"%s: Failed to enable attention interrupt\n",
-			__func__);
-		goto err_sysfs;
+				"%s: Failed to create irq thread\n",
+				__func__);
+		goto err_enable_irq;
 	}
+
 /* lcg */
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 	wake_lock_init(&rmi4_data->rmi4_wl, WAKE_LOCK_SUSPEND, "rmi4_wl");
@@ -3773,21 +4003,25 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	retval = synaptics_rmi4_check_configuration(rmi4_data);
 	if (retval < 0) {
 		dev_err(&client->dev, "Failed to check configuration\n");
-		return retval;
+		goto err_check_configuration;
 	}
 
 	return retval;
 
+err_check_configuration:
+	free_irq(rmi4_data->irq, rmi4_data);
+
+err_enable_irq:
 err_sysfs:
 	for (attr_count--; attr_count >= 0; attr_count--) {
 		sysfs_remove_file(&rmi4_data->input_dev->dev.kobj,
 				&attrs[attr_count].attr);
 	}
+
 err_create_debugfs_file:
 	debugfs_remove_recursive(rmi4_data->dir);
+
 err_create_debugfs_dir:
-	free_irq(rmi4_data->irq, rmi4_data);
-err_enable_irq:
 	cancel_delayed_work_sync(&rmi4_data->det_work);
 	flush_workqueue(rmi4_data->det_workqueue);
 	destroy_workqueue(rmi4_data->det_workqueue);
@@ -3876,6 +4110,13 @@ static int synaptics_rmi4_remove(struct i2c_client *client)
 		sysfs_remove_file(&rmi4_data->input_dev->dev.kobj,
 				&attrs[attr_count].attr);
 	}
+
+#ifdef CONFIG_FB
+	fb_unregister_client(&rmi4_data->fb_notif);
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	tasha_unregister_client(&rmi4_data->tasha_notif);
+#endif
 
 	input_unregister_device(rmi4_data->input_dev);
 
@@ -3984,12 +4225,10 @@ static void synaptics_rmi4_sensor_wake(struct synaptics_rmi4_data *rmi4_data)
 		return;
 	}
 
-	if (device_ctrl.nosleep == NO_SLEEP_OFF &&
-		device_ctrl.sleep_mode == NORMAL_OPERATION) {
+	if (device_ctrl.nosleep == NO_SLEEP_OFF && device_ctrl.sleep_mode == NORMAL_OPERATION) {
 		rmi4_data->sensor_sleep = false;
 		return;
 	}
-
 	device_ctrl.sleep_mode = NORMAL_OPERATION;
 	device_ctrl.nosleep = NO_SLEEP_OFF;
 
@@ -4022,13 +4261,12 @@ static int fb_notifier_callback(struct notifier_block *self,
 		else if (event == FB_EVENT_BLANK) {
 			blank = evdata->data;
 /* lcg */
-			if ((*blank == FB_BLANK_UNBLANK) ||
-			    (*blank == FB_BLANK_VSYNC_SUSPEND)) {
+			if ((*blank == FB_BLANK_UNBLANK) || (*blank == FB_BLANK_VSYNC_SUSPEND)){
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 				scr_suspended = false;
 #endif
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
-				sovc_force_off = false;
+				cancel_delayed_work(&rmi4_data->touch_off_work);
 #endif
 				synaptics_rmi4_resume(
 					&(rmi4_data->input_dev->dev));
@@ -4036,6 +4274,9 @@ static int fb_notifier_callback(struct notifier_block *self,
 			} else if (*blank == FB_BLANK_POWERDOWN) {
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 				scr_suspended = true;
+#endif
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+				cancel_delayed_work(&rmi4_data->touch_off_work);
 #endif
 				synaptics_rmi4_suspend(
 					&(rmi4_data->input_dev->dev));
@@ -4108,6 +4349,31 @@ static void synaptics_rmi4_late_resume(struct early_suspend *h)
 }
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static int tasha_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct synaptics_rmi4_data *rmi4_data =
+		container_of(self, struct synaptics_rmi4_data, tasha_notif);
+	unsigned int delay = SOVC_TOUCH_OFF_DELAY;
+
+	if (!sovc_switch)
+		return 0;
+
+	cancel_delayed_work(&rmi4_data->touch_off_work);
+
+	if (event == TASHA_EVENT_STOPPED) {
+		if (sovc_force_off)
+			delay = 0;
+		queue_delayed_work(rmi4_data->touch_off_workqueue,
+				&rmi4_data->touch_off_work,
+				msecs_to_jiffies(delay));
+	}
+
+	return 0;
+}
+#endif
+
 static int synaptics_rmi4_regulator_lpm(struct synaptics_rmi4_data *rmi4_data,
 						bool on)
 {
@@ -4129,6 +4395,8 @@ static int synaptics_rmi4_regulator_lpm(struct synaptics_rmi4_data *rmi4_data,
 		}
 
 		if (rmi4_data->board->power_down_enable) {
+			if (gpio_is_valid(rmi4_data->board->reset_gpio))
+				gpio_set_value(rmi4_data->board->reset_gpio, 0);
 			retval = regulator_disable(rmi4_data->vcc_i2c);
 			if (retval) {
 				dev_err(&rmi4_data->i2c_client->dev,
@@ -4273,14 +4541,9 @@ static int synaptics_rmi4_suspend_trigger(struct synaptics_rmi4_data *rmi4_data)
 {
 	int retval = 0;
 
-	if (rmi4_data->touch_off_triggered)
-		return 0;
-
-	rmi4_data->touch_off_triggered = true;
+	mutex_lock(&suspend_resume_lock);
 
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
-	if (!scr_suspended)
-		goto out;
 
 	if (is_touch_on()) {
 		if (!irq_wake_enabled) {
@@ -4294,7 +4557,6 @@ static int synaptics_rmi4_suspend_trigger(struct synaptics_rmi4_data *rmi4_data)
 
 		goto out;
 	}
-#endif
 
 	if (irq_wake_enabled) {
 		disable_irq_wake(rmi4_data->irq);
@@ -4306,7 +4568,8 @@ static int synaptics_rmi4_suspend_trigger(struct synaptics_rmi4_data *rmi4_data)
 		goto out;
 	} else
 		rmi4_data->staying_awake = false;
-		cancel_work_sync(&rmi4_data->init_work);
+
+	cancel_work_sync(&rmi4_data->init_work);
 
 	if (rmi4_data->suspended) {
 		dev_info(&rmi4_data->i2c_client->dev,
@@ -4378,7 +4641,7 @@ err_lpm_regulator:
 	}
 
 out:
-	rmi4_data->touch_off_triggered = false;
+	mutex_unlock(&suspend_resume_lock);
 	return retval;
 }
 
@@ -4389,18 +4652,11 @@ static void synaptics_rmi4_touch_off(struct work_struct *work)
 	struct synaptics_rmi4_data *rmi4_data =
 		container_of(work, struct synaptics_rmi4_data, touch_off_work.work);
 
+	if (!scr_suspended || rmi4_data->suspended)
+		return;
+
 	synaptics_rmi4_suspend_trigger(rmi4_data);
 }
-
-static struct synaptics_rmi4_data *rmi4_data_tmp;
-
-void synaptics_rmi4_touch_off_trigger(unsigned int delay)
-{
-	queue_delayed_work(rmi4_data_tmp->touch_off_workqueue,
-			&rmi4_data_tmp->touch_off_work,
-			msecs_to_jiffies(delay));
-}
-EXPORT_SYMBOL(synaptics_rmi4_touch_off_trigger);
 #endif
 
  /**
@@ -4417,13 +4673,74 @@ EXPORT_SYMBOL(synaptics_rmi4_touch_off_trigger);
 static int synaptics_rmi4_suspend(struct device *dev)
 {
 	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
-#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
-	rmi4_data_tmp = rmi4_data;
+/*	int retval;*/
+/*
+#ifdef CONFIG_THERMAL_MONITOR
+	// Must be doen before msm_hotplug_suspend()
+	msm_thermal_suspend(true);
 #endif
-
+*/
 	return synaptics_rmi4_suspend_trigger(rmi4_data);
-}
 
+/*	if (rmi4_data->stay_awake) {
+		rmi4_data->staying_awake = true;
+		return 0;
+	} else
+		rmi4_data->staying_awake = false;
+	cancel_work_sync(&rmi4_data->init_work);
+	if (rmi4_data->suspended) {
+		dev_info(dev, "Already in suspend state\n");
+		return 0;
+	}
+	synaptics_secure_touch_stop(rmi4_data, 1);
+	if (!rmi4_data->fw_updating) {
+		if (!rmi4_data->sensor_sleep) {
+			rmi4_data->touch_stopped = true;
+			wake_up(&rmi4_data->wait);
+			synaptics_rmi4_irq_enable(rmi4_data, false);
+			synaptics_rmi4_sensor_sleep(rmi4_data);
+		}
+		synaptics_rmi4_release_all(rmi4_data);
+		retval = synaptics_rmi4_regulator_lpm(rmi4_data, true);
+		if (retval < 0) {
+			dev_err(dev, "failed to enter low power mode\n");
+			goto err_lpm_regulator;
+		}
+	} else {
+		dev_err(dev, "Firmware updating, cannot go into suspend mode\n");
+		return 0;
+	}
+	if (rmi4_data->board->disable_gpios) {
+		if (rmi4_data->ts_pinctrl) {
+			retval = pinctrl_select_state(rmi4_data->ts_pinctrl, rmi4_data->pinctrl_state_suspend);
+			if (retval < 0)
+				dev_err(dev, "failed to select idle pinctrl state\n");
+		}
+		retval = synaptics_rmi4_gpio_configure(rmi4_data, false);
+		if (retval < 0) {
+			dev_err(dev, "failed to put gpios in suspend state\n");
+			goto err_gpio_configure;
+		}
+	}
+	mutex_lock(&suspended_mutex);
+	rmi4_data->suspended = true;
+	mutex_unlock(&suspended_mutex);
+	return 0;
+err_gpio_configure:
+	if (rmi4_data->ts_pinctrl) {
+		retval = pinctrl_select_state(rmi4_data->ts_pinctrl, rmi4_data->pinctrl_state_active);
+		if (retval < 0)
+			dev_err(dev, "failed to select get default pinctrl state\n");
+	}
+	synaptics_rmi4_regulator_lpm(rmi4_data, false);
+err_lpm_regulator:
+	if (rmi4_data->sensor_sleep) {
+		synaptics_rmi4_sensor_wake(rmi4_data);
+		synaptics_rmi4_irq_enable(rmi4_data, true);
+		rmi4_data->touch_stopped = false;
+	}
+	return retval;*/
+}
  /**
  * synaptics_rmi4_resume()
  *
@@ -4437,7 +4754,9 @@ static int synaptics_rmi4_suspend(struct device *dev)
 static int synaptics_rmi4_resume(struct device *dev)
 {
 	struct synaptics_rmi4_data *rmi4_data = dev_get_drvdata(dev);
-	int retval;
+
+	mutex_lock(&suspend_resume_lock);
+
 /* lcg */
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 	if (irq_wake_enabled) {
@@ -4447,91 +4766,31 @@ static int synaptics_rmi4_resume(struct device *dev)
 		mutex_lock(&suspended_mutex);
 		rmi4_data->suspended = false;
 		mutex_unlock(&suspended_mutex);
-		return 0;
+		goto out;
 	}
 #endif
-
+/*
+#ifdef CONFIG_THERMAL_MONITOR
+	msm_thermal_suspend(false);
+#endif
+*/
 	if (rmi4_data->staying_awake)
-		return 0;
+		goto out;
 
 	flush_workqueue(rmi4_data->det_workqueue);
 	if (!rmi4_data->suspended) {
 		dev_info(dev, "Already in awake state\n");
-		return 0;
+		goto out;
 	}
 
 	queue_work(rmi4_data->det_workqueue, &rmi4_data->init_work);
 
-	synaptics_secure_touch_stop(rmi4_data, 1);
-
-	retval = synaptics_rmi4_regulator_lpm(rmi4_data, false);
-	if (retval < 0) {
-		dev_err(dev, "Failed to enter active power mode\n");
-		return retval;
-	}
-
-	if (rmi4_data->board->disable_gpios) {
-		if (rmi4_data->ts_pinctrl) {
-			retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
-					rmi4_data->pinctrl_state_active);
-			if (retval < 0)
-				dev_err(dev, "failed to select default pinctrl state\n");
-		}
-
-		retval = synaptics_rmi4_gpio_configure(rmi4_data, true);
-		if (retval < 0) {
-			dev_err(dev, "Failed to put gpios in active state\n");
-			goto err_gpio_configure;
-		}
-	}
-
-	synaptics_rmi4_sensor_wake(rmi4_data);
-	rmi4_data->touch_stopped = false;
-	synaptics_rmi4_irq_enable(rmi4_data, true);
-
-	retval = synaptics_rmi4_check_configuration(rmi4_data);
-	if (retval < 0) {
-		dev_err(dev, "Failed to check configuration\n");
-		goto err_check_configuration;
-	}
-	rmi4_data->suspended = false;
-
+out:
+	mutex_unlock(&suspend_resume_lock);
 	return 0;
-
-err_check_configuration:
-	synaptics_rmi4_irq_enable(rmi4_data, false);
-	rmi4_data->touch_stopped = true;
-	synaptics_rmi4_sensor_sleep(rmi4_data);
-
-	if (rmi4_data->board->disable_gpios) {
-		if (rmi4_data->ts_pinctrl) {
-			retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
-					rmi4_data->pinctrl_state_suspend);
-			if (retval < 0)
-				dev_err(dev, "failed to select idle pinctrl state\n");
-		}
-
-		synaptics_rmi4_gpio_configure(rmi4_data, false);
-	}
-	synaptics_rmi4_regulator_lpm(rmi4_data, true);
-	wake_up(&rmi4_data->wait);
-
-	return retval;
-
-err_gpio_configure:
-	if (rmi4_data->ts_pinctrl) {
-		retval = pinctrl_select_state(rmi4_data->ts_pinctrl,
-					rmi4_data->pinctrl_state_suspend);
-		if (retval < 0)
-			pr_err("failed to select idle pinctrl state\n");
-	}
-	synaptics_rmi4_regulator_lpm(rmi4_data, true);
-	wake_up(&rmi4_data->wait);
-
-	return retval;
 }
 
-#if (!defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND))
+/*#if (!defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND))*/
 static const struct dev_pm_ops synaptics_rmi4_dev_pm_ops = {
 	.suspend = synaptics_rmi4_suspend,
 	.resume  = synaptics_rmi4_resume,
@@ -4539,7 +4798,7 @@ static const struct dev_pm_ops synaptics_rmi4_dev_pm_ops = {
 #else
 static const struct dev_pm_ops synaptics_rmi4_dev_pm_ops = {
 };
-#endif
+/*#endif*/
 #else
 static int synaptics_rmi4_suspend(struct device *dev)
 {
@@ -4572,7 +4831,7 @@ static struct i2c_driver synaptics_rmi4_driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = rmi4_match_table,
-#ifdef CONFIG_PM
+if (defined(CONFIG_PM) && !defined(CONFIG_FB))
 		.pm = &synaptics_rmi4_dev_pm_ops,
 #endif
 	},

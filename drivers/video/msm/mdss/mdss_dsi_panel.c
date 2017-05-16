@@ -292,6 +292,22 @@ disp_en_gpio_err:
 	return rc;
 }
 
+void mdss_dsi_panel_reset_dsvreg_off_trigger(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	if (ctrl_pdata->dsvreg && ctrl_pdata->dsvreg_pre_off)
+		if (regulator_disable(ctrl_pdata->dsvreg))
+			pr_info("%s: failed to pre-off dsv\n",
+						__func__);
+	gpio_set_value((ctrl_pdata->rst_gpio), 0);
+	gpio_free(ctrl_pdata->rst_gpio);
+	if (ctrl_pdata->dsvreg && !ctrl_pdata->dsvreg_pre_off)
+		if (regulator_disable(ctrl_pdata->dsvreg))
+			pr_info("%s: failed to post-off dsv\n",
+						__func__);
+
+	pr_info("%s: done", __func__);
+}
+
 void mdss_dsi_panel_reset_high(int enable)
 {
 	if(enable)
@@ -427,7 +443,7 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 		}
 
 #ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
-		if (s2w_switch)
+		if (s2w_switch == 1)
 			goto end;
 #endif
 #ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
@@ -438,9 +454,7 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 		if (sovc_switch && sovc_tmp_onoff)
 			goto end;
 #endif
-
-		gpio_set_value((ctrl_pdata->rst_gpio), 1);
-		gpio_free(ctrl_pdata->rst_gpio);
+	mdss_dsi_panel_reset_dsvreg_off_trigger(ctrl_pdata);
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 end:
 #endif
@@ -878,7 +892,7 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE) || defined(CONFIG_TOUCHSCREEN_SCROFF_VOLCTR)
 #ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
-	if (s2w_switch)
+	if (s2w_switch == 1)
 		goto touch_on;
 #endif
 #ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
@@ -897,14 +911,10 @@ touch_off:
 #endif
 
 	if (ctrl->off_cmds.cmd_cnt)
-		mdss_dsi_panel_cmds_send(ctrl, &ctrl->off_cmds, CMD_REQ_COMMIT);
-
-	if (ctrl->ds_registered && pinfo->is_pluggable) {
-		mdss_dba_utils_video_off(pinfo->dba_data);
-		mdss_dba_utils_hdcp_enable(pinfo->dba_data, false);
-	}
+		mdss_dsi_panel_cmds_send(ctrl, &ctrl->off_cmds);
 
 end:
+	pinfo->blank_state = MDSS_PANEL_BLANK_BLANK;
 	pr_debug("%s:-\n", __func__);
 	return 0;
 }

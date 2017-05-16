@@ -42,10 +42,18 @@
 #endif
 #ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
 #include <linux/input/scroff_volctr.h>
+#include <linux/wcd9330_notifier.h>
 #endif
 
 #define XO_CLK_RATE	19200000
 #define CMDLINE_DSI_CTL_NUM_STRING_LEN 2
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static bool mdss_turned_off = false;
+static int tasha_notifier_callback(struct notifier_block *self, unsigned long event, void *data);
+#endif
+
+static struct dsi_drv_cm_data shared_ctrl_data;
 
 /* Master structure to hold all the information about the DSI/panel */
 static struct mdss_dsi_data *mdss_dsi_res;
@@ -242,6 +250,55 @@ static int mdss_dsi_regulator_init(struct platform_device *pdev,
 	return rc;
 }
 
+static int mdss_dsi_panel_vreg_off_trigger(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	int ret = 0;
+	int i = 0;
+
+	for (i = DSI_MAX_PM - 1; i >= 0; i--) {
+		/*
+		 * Core power module will be disabled when the
+		 * clocks are disabled
+		 */
+		if (DSI_CORE_PM == i)
+			continue;
+		ret = msm_dss_enable_vreg(
+			ctrl_pdata->power_data[i].vreg_config,
+			ctrl_pdata->power_data[i].num_vreg, 0);
+		if (ret)
+			pr_info("%s: failed to disable vregs for %s\n",
+				__func__, __mdss_dsi_pm_name(i));
+	}
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	mdss_turned_off = true;
+#endif
+
+	pr_info("%s: done", __func__);
+
+	return ret;
+}
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static void mdss_off(struct work_struct *work)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata =
+		container_of(work, struct mdss_dsi_ctrl_pdata, mdss_off_work.work);
+
+	if (!sovc_scr_suspended)
+		return;
+
+	if (track_changed || sovc_tmp_onoff)
+		return;
+
+	if (mdss_turned_off)
+		return;
+
+	mdss_dsi_panel_reset_dsvreg_off_trigger(ctrl_pdata);
+	mdss_dsi_panel_vreg_off_trigger(ctrl_pdata);
+}
+#endif
+
 static int mdss_dsi_panel_power_off(struct mdss_panel_data *pdata)
 {
 	int ret = 0;
@@ -270,16 +327,17 @@ static int mdss_dsi_panel_power_off(struct mdss_panel_data *pdata)
 	if (mdss_dsi_pinctrl_set_state(ctrl_pdata, false))
 		pr_debug("reset disable: pinctrl not enabled\n");
 
-	ret = msm_dss_enable_vreg(
-		ctrl_pdata->panel_power_data.vreg_config,
-		ctrl_pdata->panel_power_data.num_vreg, 0);
-	if (ret)
-		pr_err("%s: failed to disable vregs for %s\n",
-			__func__, __mdss_dsi_pm_name(DSI_PANEL_PM));
+	if (ctrl_pdata->panel_bias_vreg) {
+		pr_debug("%s: Disabling panel bias vreg. ndx = %d\n",  __func__, ctrl_pdata->ndx);
+		if (mdss_dsi_labibb_vreg_ctrl(ctrl_pdata, false))
+			pr_err("Unable to disable bias vreg\n");
+		/* Add delay recommended by panel specs */
+		udelay(2000);
+	}
 
 /* lcg */
 #ifdef CONFIG_TOUCHSCREEN_SWEEP2WAKE
-	if (s2w_switch)
+	if (s2w_switch == 1)
 		goto end;
 #endif
 #ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
@@ -290,6 +348,7 @@ static int mdss_dsi_panel_power_off(struct mdss_panel_data *pdata)
 	if (sovc_switch && sovc_tmp_onoff)
 		goto end;
 #endif
+	ret = mdss_dsi_panel_vreg_off_trigger(ctrl_pdata);
 end:
 	return ret;
 }
@@ -303,6 +362,7 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 {
 	int ret = 0;
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	int i = 0;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -311,8 +371,31 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 
 	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
-
-	if (ctrl_pdata->status_error_count >= MAX_STATUS_ERROR_COUNT)
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	cancel_delayed_work(&ctrl_pdata->mdss_off_work);
+#endif
+	for (i = 0; i < DSI_MAX_PM; i++) {
+		/*
+		* Core power module will be enabled when the
+		* clocks are enabled
+		*/
+		if (DSI_CORE_PM == i)
+			continue;
+		ret = msm_dss_enable_vreg(ctrl_pdata->power_data[i].vreg_config, ctrl_pdata->power_data[i].num_vreg, 1);
+		if (ret) {
+			pr_err("%s: failed to enable vregs for %s\n", __func__, __mdss_dsi_pm_name(i));
+			goto error;
+		}
+	}
+	if (ctrl_pdata->panel_bias_vreg) {
+		pr_debug("%s: Enable panel bias vreg. ndx = %d\n", __func__, ctrl_pdata->ndx);
+		if (mdss_dsi_labibb_vreg_ctrl(ctrl_pdata, true))
+			pr_err("Unable to configure bias vreg\n");
+		/* Add delay recommended by panel specs */
+		udelay(2000);
+	}
+	i--;
+/*	if (ctrl_pdata->status_error_count >= MAX_STATUS_ERROR_COUNT)
 	{
 		pr_err("%s:ESD check Error_cnt = %i\n",__func__,ctrl_pdata->status_error_count);
 
@@ -326,7 +409,7 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 		pr_err("%s: failed to enable vregs for %s\n",
 			__func__, __mdss_dsi_pm_name(DSI_PANEL_PM));
 		return ret;
-	}
+	}*/
 
 	/*
 	 * If continuous splash screen feature is enabled, then we need to
@@ -345,6 +428,15 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 					__func__, ret);
 	}
 
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	mdss_turned_off = false;
+#endif
+
+error:
+	if (ret) {
+		for (; i >= 0; i--)
+			msm_dss_enable_vreg(ctrl_pdata->power_data[i].vreg_config, ctrl_pdata->power_data[i].num_vreg, 0);
+	}
 	return ret;
 }
 
@@ -2733,6 +2825,121 @@ exit:
 	return dsi_pan_node;
 }
 
+static int mdss_dsi_labibb_vreg_init(struct platform_device *pdev)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
+	int rc;
+
+	ctrl = platform_get_drvdata(pdev);
+	if (!ctrl) {
+		pr_err("%s: invalid driver data\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!ctrl->panel_bias_vreg)
+		return -EINVAL;
+
+	ctrl->lab = regulator_get(&pdev->dev, "lab_reg");
+	rc = PTR_RET(ctrl->lab);
+	if (rc) {
+		ctrl->lab = NULL;
+		pr_err("%s: lab_regi get failed.\n", __func__);
+		return rc;
+	}
+	ctrl->ibb = regulator_get(&pdev->dev, "ibb_reg");
+	rc = PTR_RET(ctrl->ibb);
+	if (rc) {
+		ctrl->lab = NULL;
+		ctrl->ibb = NULL;
+		pr_err("%s: ibb_regi get failed.\n", __func__);
+		regulator_put(ctrl->lab);
+		return rc;
+	}
+
+	pr_debug("%s: lab=%p ibb=%p\n", __func__,
+				ctrl->lab, ctrl->ibb);
+
+	return 0;
+}
+
+static int mdss_dsi_labibb_vreg_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
+							int enable)
+{
+	int rc;
+
+	if (!ctrl->panel_bias_vreg || !ctrl->lab || !ctrl->ibb)
+		return -EINVAL;
+
+	pr_debug("%s: ndx=%d enable=%d\n", __func__, ctrl->ndx, enable);
+
+	if (enable) {
+		rc = regulator_enable(ctrl->lab);
+		if (rc) {
+			pr_err("%s: enable failed for lab regulator\n",
+							__func__);
+			return rc;
+		}
+		rc = regulator_enable(ctrl->ibb);
+		if (rc) {
+			pr_err("%s: enable failed for ibb regulator\n",
+							__func__);
+			regulator_disable(ctrl->lab);
+			return rc;
+		}
+
+	} else {
+		rc = regulator_disable(ctrl->lab);
+		if (rc) {
+			pr_err("%s: disable failed for lab regulator\n",
+							__func__);
+			return rc;
+		}
+
+		rc = regulator_disable(ctrl->ibb);
+		if (rc) {
+			pr_err("%s: disable failed for ibb regulator\n",
+							__func__);
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+static int mdss_dsi_regulator_init(struct platform_device *pdev)
+{
+	int rc = 0;
+
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	int i = 0;
+
+	if (!pdev) {
+		pr_err("%s: invalid input\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl_pdata = platform_get_drvdata(pdev);
+	if (!ctrl_pdata) {
+		pr_err("%s: invalid driver data\n", __func__);
+		return -EINVAL;
+	}
+
+	for (i = 0; !rc && (i < DSI_MAX_PM); i++) {
+		rc = msm_dss_config_vreg(&pdev->dev,
+			ctrl_pdata->power_data[i].vreg_config,
+			ctrl_pdata->power_data[i].num_vreg, 1);
+		if (rc)
+			pr_err("%s: failed to init vregs for %s\n",
+				__func__, __mdss_dsi_pm_name(i));
+	}
+
+	mdss_dsi_labibb_vreg_init(pdev);
+
+	return rc;
+}
+
+
+
 static struct device_node *mdss_dsi_config_panel(struct platform_device *pdev,
 	int ndx)
 {
@@ -2757,18 +2964,54 @@ static struct device_node *mdss_dsi_config_panel(struct platform_device *pdev,
 	dsi_pan_node = mdss_dsi_find_panel_of_node(pdev, panel_cfg);
 	if (!dsi_pan_node) {
 		pr_err("%s: can't find panel node %s\n", __func__, panel_cfg);
-		of_node_put(dsi_pan_node);
-		return NULL;
+		goto error_pan_node;
 	}
+	cmd_cfg_cont_splash = mdss_panel_get_boot_cfg() ? true : false;
 
-	rc = mdss_dsi_panel_init(dsi_pan_node, ctrl_pdata, ndx);
+	rc = mdss_dsi_panel_init(dsi_pan_node, ctrl_pdata, cmd_cfg_cont_splash);
 	if (rc) {
 		pr_err("%s: dsi panel init failed\n", __func__);
-		of_node_put(dsi_pan_node);
-		return NULL;
+		goto error_pan_node;
 	}
+	rc = dsi_panel_device_register(dsi_pan_node, ctrl_pdata);
+	if (rc) {
+		pr_err("%s: dsi panel dev reg failed\n", __func__);
+		goto error_pan_node;
+	}
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+	ctrl_pdata->mdss_off_workqueue = alloc_workqueue("mdss_off_workqueue", WQ_UNBOUND | WQ_HIGHPRI, 1);
+	INIT_DELAYED_WORK(&ctrl_pdata->mdss_off_work, mdss_off);
+	ctrl_pdata->tasha_notif.notifier_call = tasha_notifier_callback;
+	if (tasha_register_client(&ctrl_pdata->tasha_notif))
+		pr_info("%s: tasha_notifier register failed\n", __func__);
+#endif
 
-	return dsi_pan_node;
+	ctrl_pdata->cmd_clk_ln_recovery_en = of_property_read_bool(pdev->dev.of_node, "qcom,dsi-clk-ln-recovery");
+	if (mdss_dsi_is_te_based_esd(ctrl_pdata)) {
+		rc = devm_request_irq(&pdev->dev,
+			gpio_to_irq(ctrl_pdata->disp_te_gpio),
+			hw_vsync_handler, IRQF_TRIGGER_FALLING,
+			"VSYNC_GPIO", ctrl_pdata);
+		if (rc) {
+			pr_err("TE request_irq failed.\n");
+			goto error_pan_node;
+		}
+		disable_irq(gpio_to_irq(ctrl_pdata->disp_te_gpio));
+	}
+	pr_debug("%s: Dsi Ctrl->%d initialized\n", __func__, index);
+	return 0;
+
+error_pan_node:
+	of_node_put(dsi_pan_node);
+	i--;
+error_vreg:
+	for (; i >= 0; i--)
+		mdss_dsi_put_dt_vreg_data(&pdev->dev,
+			&ctrl_pdata->power_data[i]);
+error_no_mem:
+	devm_kfree(&pdev->dev, ctrl_pdata);
+
+	return rc;
 }
 
 static int mdss_dsi_ctrl_clock_init(struct platform_device *ctrl_pdev,
@@ -3950,6 +4193,31 @@ static void mdss_dsi_set_prim_panel(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 		}
 	}
 }
+
+#ifdef CONFIG_TOUCHSCREEN_SCROFF_VOLCTR
+static int tasha_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata =
+		container_of(self, struct mdss_dsi_ctrl_pdata, tasha_notif);
+	unsigned int delay = SOVC_TOUCH_OFF_DELAY;
+
+	if (!sovc_switch)
+		return 0;
+
+	cancel_delayed_work(&ctrl_pdata->mdss_off_work);
+
+	if (event == TASHA_EVENT_STOPPED) {
+		if (sovc_force_off)
+			delay = 0;
+		queue_delayed_work(ctrl_pdata->mdss_off_workqueue,
+				&ctrl_pdata->mdss_off_work,
+				msecs_to_jiffies(delay));
+	}
+
+	return 0;
+}
+#endif
 
 int dsi_panel_device_register(struct platform_device *ctrl_pdev,
 	struct device_node *pan_node, struct mdss_dsi_ctrl_pdata *ctrl_pdata)
